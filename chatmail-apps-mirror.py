@@ -30,6 +30,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import sys
 import time
 import urllib.error
@@ -43,6 +44,20 @@ INI = "/usr/local/lib/chatmaild/chatmail.ini"
 UA = "chatmail-apps-mirror (+https://github.com/mrgluek/chatmail-relay-tools)"
 
 
+# urllib tries addresses in getaddrinfo order and waits the full timeout on
+# each. On relays with an IPv6 route that silently drops packets (e.g. a
+# Yggdrasil 200::/7 address) every request then hangs for a minute before
+# falling back. curl avoids this with Happy Eyeballs; we just try IPv4 first.
+_getaddrinfo = socket.getaddrinfo
+
+
+def _getaddrinfo_v4_first(*args, **kwargs):
+    return sorted(_getaddrinfo(*args, **kwargs), key=lambda ai: ai[0] != socket.AF_INET)
+
+
+socket.getaddrinfo = _getaddrinfo_v4_first
+
+
 def log(*a):
     print(*a, flush=True)
 
@@ -52,7 +67,7 @@ def get(url, headers=None, tries=3):
     req = urllib.request.Request(url, headers={"User-Agent": UA, **(headers or {})})
     for attempt in range(1, tries + 1):
         try:
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with urllib.request.urlopen(req, timeout=30) as r:
                 return r.status, r.read(), r.headers
         except urllib.error.HTTPError as e:
             if e.code == 304:
