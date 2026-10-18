@@ -1,0 +1,12 @@
+[Unit]
+Description=Mirror the webxdc App Picker into /var/www/html/apps
+Documentation=https://github.com/mrgluek/chatmail-relay-tools
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/chatmail-apps-mirror
+# Downloads are background work: do not compete with mail delivery.
+Nice=10
+IOSchedulingClass=idle

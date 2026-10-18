@@ -1,7 +1,8 @@
 # chatmail-relay-tools
 
 Small, dependency-free admin scripts for [chatmail relays](https://github.com/chatmail/relay):
-count accounts and live IMAP load, and send the numbers to ntfy or Uptime Kuma.
+count accounts and live IMAP load, send the numbers to ntfy or Uptime Kuma,
+and mirror the webxdc App Picker for users who cannot reach the upstream.
 
 Everything runs on the relay itself as root and uses only what a chatmail relay
 already has (python3, doveadm, coreutils, curl). Nothing here is touched by
@@ -12,6 +13,7 @@ already has (python3, doveadm, coreutils, curl). Nothing here is touched by
 | `chatmail-stats.py` | Accounts (total, active today / 7d / 30d / 90d, new 24h / 7d), IMAP sessions from Dovecot, imap processes, TCP on 993/143/443, load. Human, JSON or CSV output. |
 | `chatmail-ntfy-daily.sh` | Once-a-day summary to an [ntfy](https://ntfy.sh) topic, with the change in account count since the previous run. |
 | `chatmail-kuma-push.sh` | Sends numbers to [Uptime Kuma](https://github.com/louislam/uptime-kuma) Push monitors so Kuma graphs them. |
+| `chatmail-apps-mirror.py` | Local copy of the webxdc App Picker (apps list, `.xdc` files, store page) at `https://<relay>/apps/`, refreshed by a systemd timer. |
 
 ## How the numbers are counted
 
@@ -35,6 +37,7 @@ cd chatmail-relay-tools
 install -m 755 chatmail-stats.py      /usr/local/bin/chatmail-stats
 install -m 755 chatmail-ntfy-daily.sh /usr/local/bin/chatmail-ntfy-daily   # optional
 install -m 755 chatmail-kuma-push.sh  /usr/local/bin/chatmail-kuma-push    # optional
+install -m 755 chatmail-apps-mirror.py /usr/local/bin/chatmail-apps-mirror # optional
 ```
 
 The ntfy and Kuma scripts call `/usr/local/bin/chatmail-stats`.
@@ -126,6 +129,56 @@ echo '*/5 * * * * root /usr/local/bin/chatmail-kuma-push' > /etc/cron.d/chatmail
 Each value is sent as `ping`, so Kuma draws it on the response-time chart
 (ignore the "ms" label). Empty tokens are skipped. The disk monitor goes DOWN
 when usage reaches `DISK_WARN`.
+
+## webxdc App Picker mirror
+
+Delta Chat picks mini apps from two upstream sites: the
+[xdcget export](https://apps.testrun.org/) (`xdcget-lock.json`, `.xdc` files,
+icons) used by Desktop, and the [store page](https://webxdc.org/apps/) opened
+on Android. Where those are blocked, `chatmail-apps-mirror` keeps a copy of
+both on the relay. Their file names do not overlap, so one URL serves every
+client:
+
+```
+https://<relay>/apps/
+```
+
+Set it as the webxdc store URL in the client's experimental settings
+(Desktop: Settings → Advanced → Experimental features), or just open it in a
+browser. Desktop reads `xdcget-lock.json` from it; Android/iOS open it as the
+store page.
+
+What the copy changes:
+
+- `main.js` loads the list and icons from `/apps` instead of testrun.org.
+- In `xdcget-lock.json` every app's `url` points at our copy of the `.xdc`.
+  Desktop with a custom store URL downloads from `url`, which upstream is the
+  developer's GitHub/Codeberg release.
+- Desktop still loads **icons** from apps.testrun.org (hardcoded in the
+  client); without access there the list shows no icons, but apps install.
+
+How it is stored: each run builds a full release in
+`/var/lib/chatmail-apps-mirror/<time>/` (unchanged files are hard-linked from
+the previous release after an `If-Modified-Since` check, so only new files are
+downloaded), then atomically switches the symlink
+`/var/www/html/apps` to it. A failed run leaves the previous copy in place;
+the previous release is kept for rollback. About 120 MB.
+
+The relay's nginx already serves `/var/www/html` and `cmdeploy run` copies its
+web pages there without `--delete`, so no nginx change is needed and the
+mirror survives redeploys.
+
+```sh
+install -m 755 chatmail-apps-mirror.py /usr/local/bin/chatmail-apps-mirror
+install -m 644 systemd/chatmail-apps-mirror.* /etc/systemd/system/
+systemctl daemon-reload
+systemctl start chatmail-apps-mirror          # first sync, ~2 min
+systemctl enable --now chatmail-apps-mirror.timer
+journalctl -u chatmail-apps-mirror -n 5       # "167 apps, downloaded ..."
+```
+
+The public URL defaults to `https://<mail_domain>/apps/` from `chatmail.ini`;
+use `--public-url` / `--dest` for another place.
 
 ## Privacy
 
