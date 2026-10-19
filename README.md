@@ -158,10 +158,13 @@ What the copy changes:
   client); without access there the list shows no icons, but apps install.
 
 How it is stored: each run builds a full release in
-`/var/lib/chatmail-apps-mirror/<time>/` (unchanged files are hard-linked from
-the previous release after an `If-Modified-Since` check, so only new files are
-downloaded), then atomically switches the symlink
-`/var/www/html/apps` to it. A failed run leaves the previous copy in place;
+`/var/lib/chatmail-apps-mirror/<time>/`, then atomically switches the symlink
+`/var/www/html/apps` to it. Unchanged files are hard-linked from the previous
+release: `.xdc` files by name (the version is part of it, so they are not even
+requested), icons and store files by content. apps.testrun.org re-dates all
+its files on every export, so dates cannot tell what changed; comparing
+content keeps our `Last-Modified`/`ETag` stable and lets browsers reuse cached
+icons. A failed run leaves the previous copy in place;
 the previous release is kept for rollback. About 120 MB.
 
 The relay's nginx already serves `/var/www/html` and `cmdeploy run` copies its

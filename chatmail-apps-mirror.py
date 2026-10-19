@@ -17,9 +17,11 @@ both clients. Two rewrites make the copy self-contained:
     GitHub/Codeberg release), not from the store, so without this the files
     would still come from abroad. The store page does not read `url`.
 
-Each run builds a complete new release next to the old one (unchanged files
-are hard-linked, not downloaded again), checks it, and then switches the
-`--dest` symlink atomically. If anything fails, the previous copy stays.
+Each run builds a complete new release next to the old one, checks it, and
+then switches the `--dest` symlink atomically. If anything fails, the
+previous copy stays. Unchanged files are hard-linked from the old release
+(.xdc by name, everything else by content), so they keep their mtime and
+nginx keeps the same Last-Modified/ETag: browsers reuse their cached icons.
 
 Usage: chatmail-apps-mirror [--dest /var/www/html/apps] [--public-url URL]
 """
@@ -98,27 +100,53 @@ def last_modified(headers):
     return None
 
 
-def fetch_file(url, rel, new, old):
-    """Put `rel` into the new release: hard-link it from the old one if the
-    server says it has not changed since (If-Modified-Since -> 304),
-    otherwise download it. Returns True if it was downloaded.
-
-    The lock's `size` field is not used: it does not always match the cached
-    file, so it cannot tell whether our copy is current."""
+def put(rel, data, new, old, mtime=None):
+    """Write `rel` into the new release. If the old release has the same
+    bytes, hard-link that file instead: it keeps its mtime, so nginx keeps
+    sending the same Last-Modified/ETag and browsers can reuse their cache.
+    Returns True if the content changed."""
     src, dst = os.path.join(old, rel) if old else None, os.path.join(new, rel)
     os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if src and os.path.isfile(src) and os.path.getsize(src) == len(data):
+        with open(src, "rb") as f:
+            if f.read() == data:
+                os.link(src, dst)
+                return False
+    write(dst, data, mtime)
+    return True
+
+
+def fetch_file(url, rel, new, old, immutable=False, transform=None):
+    """Put `rel` into the new release, reusing the old copy when possible.
+    Returns True if the content changed.
+
+    apps.testrun.org regenerates its export every few hours and every file
+    gets a fresh mtime, so If-Modified-Since alone would re-download (and
+    re-date) everything. Hence:
+      * immutable files (.xdc, the version is in the name) are reused
+        without asking the server;
+      * other files are compared by content after download (see put()).
+    The lock's `size` field is not used: it does not always match the file."""
+    src = os.path.join(old, rel) if old else None
+    if immutable and src and os.path.isfile(src):
+        os.makedirs(os.path.dirname(os.path.join(new, rel)), exist_ok=True)
+        os.link(src, os.path.join(new, rel))
+        return False
     headers = {}
-    if src and os.path.isfile(src):
+    if src and os.path.isfile(src) and not transform:
+        # Still useful for webxdc.org, whose files keep their dates.
         headers["If-Modified-Since"] = email.utils.formatdate(
             os.path.getmtime(src), usegmt=True)
     status, body, h = get(url, headers)
     if status == 304:
-        os.link(src, dst)
+        os.makedirs(os.path.dirname(os.path.join(new, rel)), exist_ok=True)
+        os.link(src, os.path.join(new, rel))
         return False
     if not body:
         raise RuntimeError(f"{rel}: empty response")
-    write(dst, body, last_modified(h))
-    return True
+    if transform:
+        body = transform(body)
+    return put(rel, body, new, old, last_modified(h))
 
 
 def store_assets(text, base):
@@ -139,28 +167,28 @@ def store_assets(text, base):
 
 def mirror_store(new, old, public_path):
     """Copy the store page with all files it references."""
+
+    def patch_main_js(body):
+        # Point the page at our copy of the export.
+        js, count = re.subn(rb'(const\s+xdcget_export\s*=\s*)"[^"]*"',
+                            lambda m: m.group(1) + json.dumps(public_path).encode(), body)
+        if count != 1:
+            raise RuntimeError("main.js: xdcget_export not found, upstream changed")
+        return js
+
     todo, seen, n = ["index.html"], set(), 0
     while todo:
         rel = todo.pop()
         if rel in seen:
             continue
         seen.add(rel)
-        n += fetch_file(STORE_URL + rel, rel, new, old)
+        n += fetch_file(STORE_URL + rel, rel, new, old,
+                        transform=patch_main_js if rel == "main.js" else None)
         if rel.endswith((".html", ".js", ".css")):
             with open(os.path.join(new, rel), encoding="utf-8") as f:
                 todo += store_assets(f.read(), os.path.dirname(rel))
-
-    # Point the page at our copy of the export. The file may be a hard link
-    # into the old release, so write a new file instead of editing in place.
-    path = os.path.join(new, "main.js")
-    with open(path, encoding="utf-8") as f:
-        js = f.read()
-    js, count = re.subn(r'(const\s+xdcget_export\s*=\s*)"[^"]*"',
-                        lambda m: m.group(1) + json.dumps(public_path), js)
-    if count != 1:
-        raise RuntimeError("main.js: xdcget_export not found, upstream changed")
-    os.unlink(path)
-    write(path, js.encode())
+    if "main.js" not in seen:
+        raise RuntimeError("store page no longer loads main.js, upstream changed")
     return seen, n
 
 
@@ -177,10 +205,11 @@ def mirror_export(new, old, public_url):
                 continue
             if "/" in rel or rel.startswith("."):
                 raise RuntimeError(f"{app.get('app_id')}: bad {key} {rel!r}")
-            n += fetch_file(EXPORT_URL + urllib.parse.quote(rel), rel, new, old)
+            n += fetch_file(EXPORT_URL + urllib.parse.quote(rel), rel, new, old,
+                            immutable=key == "cache_relname")
         if app.get("cache_relname"):
             app["url"] = public_url + urllib.parse.quote(app["cache_relname"])
-    write(os.path.join(new, LOCK_NAME), json.dumps(apps, indent=1).encode())
+    n += put(LOCK_NAME, json.dumps(apps, indent=1).encode(), new, old)
     return apps, n
 
 
@@ -248,7 +277,7 @@ def main():
         p = os.path.join(args.releases, d)
         if os.path.isdir(p) and p not in keep:
             shutil.rmtree(p)
-    log(f"{len(apps)} apps, downloaded {n_export} export + {n_store} store files, "
+    log(f"{len(apps)} apps, changed {n_export} export + {n_store} store files, "
         f"now serving {new} at {public_url}")
 
 
