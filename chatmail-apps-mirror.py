@@ -17,6 +17,9 @@ both clients. Two rewrites make the copy self-contained:
     GitHub/Codeberg release), not from the store, so without this the files
     would still come from abroad. The store page does not read `url`.
 
+Icons above 192 px are downscaled in their own format if python3-pil is
+installed (the store shows them at 64 CSS px).
+
 Each run builds a complete new release next to the old one, checks it, and
 then switches the `--dest` symlink atomically. If anything fails, the
 previous copy stays. Unchanged files are hard-linked from the old release
@@ -28,6 +31,7 @@ Usage: chatmail-apps-mirror [--dest /var/www/html/apps] [--public-url URL]
 import argparse
 import email.utils
 import fcntl
+import io
 import json
 import os
 import re
@@ -192,6 +196,54 @@ def mirror_store(new, old, public_path):
     return seen, n
 
 
+ICON_MAX = 192  # px; the store shows icons at 64 CSS px, so this covers 3x screens
+icon_stats = {"shrunk": 0, "before": 0, "after": 0}
+
+
+def shrink_icon(body):
+    """Downscale an icon to ICON_MAX px on its longer side, keeping its format
+    (PNG stays PNG, JPEG stays JPEG), so file names, the lock and main.js stay
+    as they are. Returns the original bytes when Pillow is missing, the image
+    is small already, or the result would not be smaller.
+
+    Pillow writes the same bytes for the same input, so put() can still tell
+    that an icon did not change and reuse the old file with its ETag."""
+    if Image is None:
+        return body
+    try:
+        im = Image.open(io.BytesIO(body))
+        fmt = im.format
+        if fmt not in ("PNG", "JPEG") or max(im.size) <= ICON_MAX \
+                or getattr(im, "n_frames", 1) > 1:
+            return body
+        if fmt == "JPEG":
+            im = ImageOps.exif_transpose(im)  # the EXIF tag is not written back
+        elif im.mode == "P":
+            # Palette images would be resized with NEAREST; go to RGBA first.
+            im = im.convert("RGBA")
+        im.thumbnail((ICON_MAX, ICON_MAX), Image.LANCZOS)
+        out = io.BytesIO()
+        if fmt == "PNG":
+            im.save(out, "PNG", optimize=True)
+        else:
+            im.save(out, "JPEG", quality=85, optimize=True)
+    except Exception as e:  # a broken icon must not stop the mirror
+        log(f"icon left as is: {e}")
+        return body
+    if out.tell() >= len(body):
+        return body
+    icon_stats["shrunk"] += 1
+    icon_stats["before"] += len(body)
+    icon_stats["after"] += out.tell()
+    return out.getvalue()
+
+
+try:
+    from PIL import Image, ImageOps
+except ImportError:
+    Image = ImageOps = None
+
+
 def mirror_export(new, old, public_url):
     _, body, _ = get(EXPORT_URL + LOCK_NAME)
     apps = json.loads(body)
@@ -205,8 +257,12 @@ def mirror_export(new, old, public_url):
                 continue
             if "/" in rel or rel.startswith("."):
                 raise RuntimeError(f"{app.get('app_id')}: bad {key} {rel!r}")
-            n += fetch_file(EXPORT_URL + urllib.parse.quote(rel), rel, new, old,
-                            immutable=key == "cache_relname")
+            if key == "cache_relname":
+                n += fetch_file(EXPORT_URL + urllib.parse.quote(rel), rel, new, old,
+                                immutable=True)
+            else:
+                n += fetch_file(EXPORT_URL + urllib.parse.quote(rel), rel, new, old,
+                                transform=shrink_icon)
         if app.get("cache_relname"):
             app["url"] = public_url + urllib.parse.quote(app["cache_relname"])
     n += put(LOCK_NAME, json.dumps(apps, indent=1).encode(), new, old)
@@ -240,6 +296,8 @@ def main():
     if os.path.lexists(args.dest) and not os.path.islink(args.dest):
         sys.exit(f"{args.dest} exists and is not a symlink, move it away first")
 
+    if Image is None:
+        log("python3-pil not installed: icons are served at their original size")
     os.umask(0o022)  # nginx runs as www-data and must read everything
     os.makedirs(args.releases, exist_ok=True)
     lockf = open(os.path.join(args.releases, ".lock"), "w")
@@ -279,6 +337,9 @@ def main():
             shutil.rmtree(p)
     log(f"{len(apps)} apps, changed {n_export} export + {n_store} store files, "
         f"now serving {new} at {public_url}")
+    if icon_stats["shrunk"]:
+        log(f"icons: {icon_stats['shrunk']} downscaled to {ICON_MAX}px, "
+            f"{icon_stats['before'] // 1024} KiB -> {icon_stats['after'] // 1024} KiB")
 
 
 if __name__ == "__main__":

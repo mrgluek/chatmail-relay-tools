@@ -154,6 +154,10 @@ What the copy changes:
 - In `xdcget-lock.json` every app's `url` points at our copy of the `.xdc`.
   Desktop with a custom store URL downloads from `url`, which upstream is the
   developer's GitHub/Codeberg release.
+- Icons larger than 192 px are downscaled to 192 px in the same format (the
+  store shows them at 64 CSS px, so this covers 3x screens): about 2.4 MB of
+  icons become 1.2 MB. Needs `python3-pil`; without it icons are served as is.
+  Names and the lock are unchanged.
 - Desktop still loads **icons** from apps.testrun.org (hardcoded in the
   client); without access there the list shows no icons, but apps install.
 
@@ -172,6 +176,7 @@ web pages there without `--delete`, so no nginx change is needed and the
 mirror survives redeploys.
 
 ```sh
+apt install -y python3-pil   # optional, for smaller icons
 install -m 755 chatmail-apps-mirror.py /usr/local/bin/chatmail-apps-mirror
 install -m 644 systemd/chatmail-apps-mirror.* /etc/systemd/system/
 systemctl daemon-reload
